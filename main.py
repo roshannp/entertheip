@@ -1,173 +1,290 @@
-import socket
+"""
+lightweight_apifuzzing parser
+
+What it does
+- Load an OpenAPI v3 spec (dict or file.
+- Extract endpoints, methods, path/query/header params, and requestBody schema.
+- Produce a simple example payload (json-friendly) from common JSON Schema types.
+- Keep dependencies to stdlib + pyyaml (optional)
+
+How to use
+- From Python: import parse_openapi, then iterate endpoints and call example_payload(endpoint)
+- CLI: `python lightweight_apifuzzer_parser.py --spec openapi.yaml --sample-requests out.jsonl`
+
+Limitations
+- Minimal $ref resolver that works for local refs only (#/components/...).
+- Doesn't implement all JSON Schema keywords (oneOf/allOf/anyOf have simple heuristics).
+- Intended as a small, easily extensible building block for a fuzzer.
+"""
+from __future__ import annotations
+import json
 import argparse
-import threading
-from datetime import datetime
-import subprocess
+import sys
+from dataclasses import dataclass, asdict
+from typing import Any, Dict, List, Optional, Tuple, Union
+import re
 
-# Argument parsing for IP input, including the verbose flag
-parser = argparse.ArgumentParser(description="Simple Python Port Scanner with Verbose Option")
-parser.add_argument("target", help="Target IP address to scan")
-parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
-args = parser.parse_args()
-target = args.target
-verbose = args.verbose  # Store verbose flag
+try:
+    import yaml
+except Exception:
+    yaml = None
 
-# Define port range to scan all the way up to 65535
-start_port = 1
-end_port = 65535  # Change this to 65535 to scan all possible ports
 
-# Path to the wordlist for Gobuster
-wordlist = "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"
+@dataclass
+class Parameter:
+    name: str
+    in_: str
+    required: bool
+    schema: Dict[str, Any]
 
-# Lists to store open TCP ports and HTTP service ports
-open_tcp_ports = []
-http_ports = []
 
-# Define number of threads to limit concurrency
-max_threads = 50
-thread_lock = threading.Lock()
+@dataclass
+class Endpoint:
+    method: str
+    path: str
+    operation_id: Optional[str]
+    params: List[Parameter]
+    request_body_schema: Optional[Dict[str, Any]]
+    responses: Dict[str, Any]
 
-def print_banner():
-    """Prints the start banner."""
-    print("-" * 60)
-    print(f"Starting scan on target: {target}")
-    print("Scanning started at:", datetime.now())
-    print("-" * 60)
-    if verbose:
-        print("Verbose mode enabled: Detailed output will be shown.")
 
-def scan_port(port):
-    """Function to scan a single port."""
-    try:
-        # Create a socket object
-        tcp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        tcp_socket.settimeout(1)  # Timeout for 1 second
-        result = tcp_socket.connect_ex((target, port))
-        
-        # Check if the port is open
-        if result == 0:
-            with thread_lock:
-                open_tcp_ports.append(port)
-                if port in [80, 8080, 443]:  # Common HTTP ports
-                    http_ports.append(port)
-            if verbose:
-                print(f"Port {port} is open.")  # Print open ports only in verbose mode
-        tcp_socket.close()
-    except socket.error as e:
-        # Handle socket errors
-        if verbose:
-            print(f"Error scanning port {port}: {e}")
+# ----------------- spec loading / resolving -----------------
 
-def scan_tcp_ports():
-    """Scan TCP ports with threading."""
-    print("\nScanning for open TCP ports...")
-    
-    # Create threads for scanning ports
-    threads = []
-    for port in range(start_port, end_port + 1):
-        thread = threading.Thread(target=scan_port, args=(port,))
-        thread.start()
-        threads.append(thread)
-        
-        # Control number of threads running concurrently
-        if len(threads) >= max_threads:
-            for t in threads:
-                t.join()  # Wait for threads to finish
-            threads = []  # Reset threads list
-    
-    # Wait for any remaining threads
-    for t in threads:
-        t.join()
+def load_spec(path_or_dict: Union[str, Dict[str, Any]]) -> Dict[str, Any]:
+    if isinstance(path_or_dict, dict):
+        return path_or_dict
+    if isinstance(path_or_dict, str):
+        if path_or_dict.strip().startswith("{"):
+            return json.loads(path_or_dict)
+        if yaml is None and path_or_dict.endswith(('.yml', '.yaml')):
+            raise RuntimeError('pyyaml required to read YAML files; `pip install pyyaml`')
+        with open(path_or_dict, 'r', encoding='utf-8') as f:
+            txt = f.read()
+        if path_or_dict.endswith(('.yml', '.yaml')):
+            return yaml.safe_load(txt)
+        return json.loads(txt)
+    raise TypeError('spec must be a dict or path string')
 
-def display_results():
-    """Display the scan results."""
-    print("-" * 60)
-    print(f"Scanning completed at: {datetime.now()}")
-    print("-" * 60)
-    
-    print("\nOpen TCP Ports:")
-    if open_tcp_ports:
-        print(", ".join(str(port) for port in open_tcp_ports))
-    else:
-        print("No open TCP ports found.")
-    
-    print("\nHTTP Services Detected on Ports:")
-    if http_ports:
-        print(", ".join(str(port) for port in http_ports))
-    else:
-        print("No HTTP services detected.")
-    print("-" * 60)
 
-def run_gobuster(target_ip, port=80, wordlist="/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"):
-    """Run Gobuster on the target IP with a specified port."""
-    # Ensure port is valid, if None is provided, default to 80
-    if port is None:
-        port = 80
+def resolve_ref(spec: Dict[str, Any], ref: str) -> Any:
+    # supports local refs like #/components/schemas/Pet
+    if not ref.startswith('#/'):
+        raise NotImplementedError('Only local refs supported in this lightweight parser')
+    parts = ref.lstrip('#/').split('/')
+    cur = spec
+    for p in parts:
+        if p not in cur:
+            raise KeyError(f'ref path missing: {ref} (failed at {p})')
+        cur = cur[p]
+    return cur
 
-    url = f"http://{target_ip}:{port}"
-    print(f"\nRunning Gobuster on {url} with wordlist {wordlist}...")
 
-    # Define the command arguments for Gobuster
-    command = [
-        "gobuster", "dir", 
-        "-u", url, 
-        "-w", wordlist, 
-        "-t", "10",  # Set the number of threads to 10
-        "-timeout", "30s"  # Corrected timeout flag to -timeout
-    ]
+# ----------------- schema -> example/template -----------------
 
-    # Print the command to debug
-    print(f"Executing command: {' '.join(command)}")
+PRIMITIVE_DEFAULTS = {
+    'string': 'string',
+    'integer': 0,
+    'number': 0.0,
+    'boolean': True,
+}
 
-    try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            check=True
-        )
-        
-        # Print the results of Gobuster's scan
-        print("\nGobuster Results:")
-        if result.stdout:
-            print(result.stdout)
+
+def schema_to_example(schema: Dict[str, Any], spec: Dict[str, Any], depth=0) -> Any:
+    """
+    Convert a small subset of JSON Schema (as used by OpenAPI) into an example value.
+    Heuristics only: arrays produce one example item; object properties use required fields first.
+    """
+    if depth > 6:
+        return None
+
+    if not schema:
+        return None
+
+    if '$ref' in schema:
+        resolved = resolve_ref(spec, schema['$ref'])
+        return schema_to_example(resolved, spec, depth + 1)
+
+    typ = schema.get('type')
+    if not typ:
+        # try to infer
+        if 'properties' in schema:
+            typ = 'object'
+        elif 'enum' in schema:
+            typ = 'string'
+
+    if 'enum' in schema:
+        # return first enum value
+        enum = schema.get('enum', [])
+        if enum:
+            return enum[0]
+
+    if typ == 'object':
+        props = schema.get('properties', {})
+        required = set(schema.get('required', []))
+        out = {}
+        # include required fields first
+        for name in list(required) + [n for n in props.keys() if n not in required]:
+            if name not in props:
+                continue
+            out[name] = schema_to_example(props[name], spec, depth + 1)
+        return out
+
+    if typ == 'array':
+        items = schema.get('items') or {}
+        return [schema_to_example(items, spec, depth + 1)]
+
+    if typ in PRIMITIVE_DEFAULTS:
+        fmt = schema.get('format')
+        if typ == 'string' and fmt == 'email':
+            return 'user@example.com'
+        if typ == 'string' and fmt == 'uuid':
+            return '00000000-0000-0000-0000-000000000000'
+        if 'example' in schema:
+            return schema['example']
+        if 'default' in schema:
+            return schema['default']
+        return PRIMITIVE_DEFAULTS[typ]
+
+    # fallback: try oneOf/anyOf/allOf
+    if 'oneOf' in schema:
+        return schema_to_example(schema['oneOf'][0], spec, depth + 1)
+    if 'anyOf' in schema:
+        return schema_to_example(schema['anyOf'][0], spec, depth + 1)
+    if 'allOf' in schema:
+        # merge simply
+        merged = {}
+        for s in schema['allOf']:
+            if '$ref' in s:
+                s = resolve_ref(spec, s['$ref'])
+            if 'properties' in s:
+                merged.setdefault('properties', {}).update(s.get('properties', {}))
+            if 'required' in s:
+                merged.setdefault('required', []).extend(s.get('required', []))
+        return schema_to_example(merged, spec, depth + 1)
+
+    return None
+
+
+# ----------------- parse OpenAPI -----------------
+
+def extract_request_body_schema(request_body: Dict[str, Any], spec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not request_body:
+        return None
+    # prefer application/json
+    content = request_body.get('content', {})
+    if 'application/json' in content:
+        schema = content['application/json'].get('schema')
+        if schema:
+            return schema
+    # pick first
+    for ctype, obj in content.items():
+        if 'schema' in obj:
+            return obj['schema']
+    return None
+
+
+def parse_openapi(spec: Dict[str, Any]) -> List[Endpoint]:
+    paths = spec.get('paths', {})
+    endpoints: List[Endpoint] = []
+    for path, path_item in paths.items():
+        for method in ('get', 'post', 'put', 'patch', 'delete', 'head', 'options'):
+            if method not in path_item:
+                continue
+            op = path_item[method]
+            params_raw = []
+            # parameters can be defined on path level and operation level
+            params_agg = []
+            if 'parameters' in path_item:
+                params_agg.extend(path_item['parameters'] or [])
+            if 'parameters' in op:
+                params_agg.extend(op['parameters'] or [])
+            for p in params_agg:
+                if '$ref' in p:
+                    p = resolve_ref(spec, p['$ref'])
+                schema = p.get('schema', {})
+                params_raw.append(Parameter(name=p['name'], in_=p['in'], required=p.get('required', False), schema=schema))
+
+            rb_schema = None
+            if 'requestBody' in op:
+                rb_schema = extract_request_body_schema(op['requestBody'], spec)
+                if rb_schema and '$ref' in rb_schema:
+                    rb_schema = resolve_ref(spec, rb_schema['$ref'])
+
+            responses = op.get('responses', {})
+            endpoints.append(Endpoint(method=method.upper(), path=path, operation_id=op.get('operationId'), params=params_raw, request_body_schema=rb_schema, responses=responses))
+    return endpoints
+
+
+# ----------------- utility: render example request -----------------
+
+def build_example_request(base_url: str, ep: Endpoint, spec: Dict[str, Any]) -> Dict[str, Any]:
+    url = base_url.rstrip('/') + ep.path
+    path_params = {p.name: schema_to_example(p.schema, spec) for p in ep.params if p.in_ == 'path'}
+    # substitute path params
+    for k, v in path_params.items():
+        placeholder = '{' + k + '}'
+        if placeholder in url:
+            url = url.replace(placeholder, str(v))
         else:
-            print("No output received. Possible network issues or no directories found.")
-        
-        if result.stderr:
-            print("\nGobuster Errors (if any):")
-            print(result.stderr)
-    
-    except subprocess.CalledProcessError as e:
-        # Gobuster returned a non-zero exit status
-        print("Gobuster encountered an error:")
-        print(e.stderr)  # Error output from Gobuster
-    
-    except FileNotFoundError:
-        # Gobuster binary not found
-        print("Gobuster is not installed or could not be found. Please install Gobuster and try again.")
-    
-    except Exception as e:
-        # Catch any other unforeseen errors
-        print(f"An unexpected error occurred: {e}")
+            # some specs use :param style? just append
+            pass
 
-def main():
-    """Main function to run all steps."""
-    print_banner()
-    
-    # Run port scan
-    scan_tcp_ports()
-    
-    # Display results
-    display_results()
-    
-    # Run Gobuster on the main IP
-    run_gobuster(target)
-    
-    # Run Gobuster on detected HTTP service ports
-    for port in http_ports:
-        run_gobuster(target, port)
+    query_params = {p.name: schema_to_example(p.schema, spec) for p in ep.params if p.in_ == 'query'}
+    headers = {p.name: schema_to_example(p.schema, spec) for p in ep.params if p.in_ == 'header'}
 
-# Execute main function
-if __name__ == "__main__":
+    body = None
+    if ep.request_body_schema:
+        body = schema_to_example(ep.request_body_schema, spec)
+
+    return {
+        'method': ep.method,
+        'url': url,
+        'query': query_params,
+        'headers': headers,
+        'body': body,
+    }
+
+
+# ----------------- CLI -----------------
+
+def main(argv: Optional[List[str]] = None):
+    p = argparse.ArgumentParser(description='Lightweight OpenAPI parser for APIFuzzing')
+    p.add_argument('--spec', required=True, help='OpenAPI spec file (json or yaml) or raw JSON string')
+    p.add_argument('--base-url', default='http://localhost:8000', help='Base URL to render example requests')
+    p.add_argument('--sample-requests', help='Write example requests as JSONL')
+    p.add_argument('--dump-endpoints', help='Print parsed endpoints as JSON')
+    args = p.parse_args(argv)
+
+    spec = load_spec(args.spec)
+    endpoints = parse_openapi(spec)
+
+    if args.dump_endpoints:
+        serial = [
+            {
+                'method': e.method,
+                'path': e.path,
+                'operation_id': e.operation_id,
+                'params': [asdict(p) for p in e.params],
+                'has_request_body': bool(e.request_body_schema),
+            }
+            for e in endpoints
+        ]
+        with open(args.dump_endpoints, 'w', encoding='utf-8') as f:
+            json.dump(serial, f, indent=2)
+        print('wrote', args.dump_endpoints)
+
+    if args.sample_requests:
+        with open(args.sample_requests, 'w', encoding='utf-8') as out:
+            for e in endpoints:
+                req = build_example_request(args.base_url, e, spec)
+                out.write(json.dumps(req) + '\n')
+        print('wrote', args.sample_requests)
+
+    if not args.sample_requests and not args.dump_endpoints:
+        # print a quick summary
+        for e in endpoints:
+            print(f"{e.method} {e.path}  body={'yes' if e.request_body_schema else 'no'} params={len(e.params)}")
+
+
+if __name__ == '__main__':
     main()
